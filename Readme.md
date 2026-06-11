@@ -1,159 +1,132 @@
-# QLTTokenReceiver – Single-Transaction QLToken Farming (Fuji / AVAX Testnet)
+# QLTTokenReceiver
 
-This assignment implements a small helper contract and script to interact with an existing **Minter** contract on **Avalanche Fuji testnet**.
+A single transaction that turns 10,000 wei of AVAX into 1,000,000 QLTokens on the Avalanche Fuji testnet.
 
-## 🎯 Assignment Summary
+![Solidity](https://img.shields.io/badge/Solidity-0.8.28-363636?logo=solidity&logoColor=white)
+![Hardhat](https://img.shields.io/badge/Hardhat-2.22-FFF100?logo=hardhat&logoColor=black)
+![Network](https://img.shields.io/badge/Network-Avalanche%20Fuji-E84142?logo=avalanche&logoColor=white)
 
-Given:
+## Overview
 
-- **USDTqL**: `0x11Dc55cF35F472B363eEa3bdec5895c4edd270f1`
-- **QLToken**: `0xc2351Bf4f0e5e8Eccc02e88D63969ad08eaD1132`
-- **Minter**: `0x27ca088aE7F52889f97323fd8234D9aD67a5697f`
+This project solves a small but realistic on-chain composition problem: chain three dependent token operations together so they either all succeed or all revert, inside one atomic transaction.
 
-Behavior:
+There is an existing `Minter` contract deployed on Fuji that exposes two steps:
 
-- For every **1 wei of AVAX** you send to `getUSD()` (payable) on `Minter`, you receive **100 USDTqL** tokens.
-- For every **1 USDTqL** deposited via `getQLToken(uint amount)`, you receive **1 QLToken`.
+1. `getUSD()` (payable): for every 1 wei of AVAX sent, it mints 100 USDTqL to the caller.
+2. `getQLToken(uint amount)`: it burns/pulls USDTqL from the caller and mints an equal amount of QLToken in return.
 
-👉 **Goal**:  
-Create a contract that, in **a single transaction**, results in you receiving **1,000,000 QLTokens**.
+Doing this by hand means sending AVAX, waiting for confirmation, approving USDTqL, then calling the converter, which is three separate transactions with three chances to fail or be front-run partway through.
 
----
+`QLTTokenReceiver` collapses all of that into a single `convert()` call. The caller sends exactly 10,000 wei of AVAX once, and the contract performs the mint, the approval, the conversion, and the final payout in one transaction. Because everything happens in one call, the operation is atomic: if any step reverts, the whole thing reverts and no partial state is left behind.
 
-## 🧩 How `QLTTokenReceiver` Works
+The math:
 
-### Contract: `Fuji-Awax.sol`
+- 10,000 wei AVAX, multiplied by 100, gives 1,000,000 USDTqL.
+- 1,000,000 USDTqL, converted 1 to 1, gives 1,000,000 QLToken.
+
+## Contract
+
+Source: [`Contracts/Fuji_AVAX.sol`](Contracts/Fuji_AVAX.sol)
+
+`QLTTokenReceiver` is constructed with three addresses (the `Minter`, the USDTqL token, and the QLToken) and stores each as a typed interface. Its single entry point is `convert()`:
 
 ```solidity
-contract QLTTokenReceiver {
-    IMinter public minter;
-    IERC20 public usdtql;
-    IERC20 public qltoken;
+function convert() external payable {
+    require(msg.value == 10000, "Send exactly 10,000 wei AVAX");
 
-    constructor(address _minterAddress, address _usdtqlAddress, address _qltokenAddress) {
-        minter = IMinter(_minterAddress);
-        usdtql = IERC20(_usdtqlAddress);
-        qltoken = IERC20(_qltokenAddress);
-    }
-
-    function convert() external payable {
-        require(msg.value == 10000, "Send exactly 10,000 wei AVAX");
-
-        // 1) Call Minter to get USDTqL
-        minter.getUSD{value: msg.value}(); // 10,000 wei → 10,000 * 100 = 1,000,000 USDTqL
-
-        // 2) Approve Minter to pull USDTqL from this contract
-        usdtql.approve(address(minter), 1_000_000);
-
-        // 3) Convert USDTqL to QLToken in a single call
-        minter.getQLToken(1_000_000);
-
-        // 4) Send resulting QLToken to the user
-        qltoken.transfer(msg.sender, 1_000_000);
-    }
+    minter.getUSD{value: msg.value}();      // mints 10,000 * 100 = 1,000,000 USDTqL to this contract
+    usdtql.approve(address(minter), 1000000); // lets Minter pull the USDTqL back
+    minter.getQLToken(1000000);             // mints 1,000,000 QLToken to this contract
+    qltoken.transfer(msg.sender, 1000000);  // forwards the QLToken to the caller
 }
 ```
 
-Flow in one transaction (user calls ```convert```):
+Step by step, within one transaction:
 
-1. User sends 10,000 wei AVAX to ```convert()```.
+1. The caller sends exactly 10,000 wei of AVAX to `convert()`. Any other amount reverts.
+2. The contract forwards that AVAX to `minter.getUSD()`, receiving 1,000,000 USDTqL.
+3. The contract approves the `Minter` to spend its USDTqL.
+4. The contract calls `minter.getQLToken(1000000)`, receiving 1,000,000 QLToken.
+5. The contract transfers the 1,000,000 QLToken to the original caller.
 
-2. ```convert()``` calls ```minter.getUSD{value: msg.value}()```:
-   - Minter mints ```msg.value * 100``` = ```10,000 * 100 = 1,000,000``` USDTqL to this contract.
+The USDTqL and QLToken interactions use a minimal local `IERC20` interface (`approve`, `balanceOf`, `transfer`), and the `Minter` is accessed through a minimal `IMinter` interface (`getUSD`, `getQLToken`).
 
-3. Contract approves Minter to spend ```1,000,000``` USDTqL.
-4. Contract calls ```minter.getQLToken(1_000,000)```:
-   - Minter mints ```1,000,000``` QLToken to this contract.
+### Reference addresses (Avalanche Fuji testnet)
 
-5. Contract transfers ```1,000,000``` QLToken to the original caller.
+| Contract | Address |
+| --- | --- |
+| Minter   | `0x27ca088aE7F52889f97323fd8234D9aD67a5697f` |
+| USDTqL   | `0x11Dc55cF35F472B363eEa3bdec5895c4edd270f1` |
+| QLToken  | `0xc2351Bf4f0e5e8Eccc02e88D63969ad08eaD1132` |
 
-Result: Caller receives <b>1,000,000 QLToken</b> in <b>one atomic transaction</b>.
+## Tech stack
 
-## 🛠 Hardhat Setup
-### Install dependencies
-If not already done:
+- Solidity 0.8.28
+- Hardhat 2.22
+- @nomicfoundation/hardhat-toolbox (ethers, testing, and tooling)
+- @nomicfoundation/hardhat-verify (Snowtrace and Sourcify verification)
+- dotenv (environment configuration)
+- Avalanche Fuji C-Chain testnet
 
-```
-npm init -y
-npm install --save-dev hardhat @nomicfoundation/hardhat-toolbox @nomicfoundation/hardhat-verify dotenv
-npx hardhat       
-```
-Ensure:
+## Getting started
 
-- ```contracts/Fuji-Awax.sol```
-
-- ```scripts/deploy.js```
-
-- ```hardhat.config.js```
-
-### Environment variables
-
-Create ```.env```:
+### 1. Install dependencies
 
 ```bash
-PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE
-SNOWTRACE_API_KEY=YOUR_SNOWTRACE_API_KEY_HERE
+npm install
 ```
----
 
-## 🚀 Deployment & Interaction (Fuji)
-### Compile
+### 2. Configure environment
+
+Create a `.env` file in the project root (see [Environment variables](#environment-variables) below).
+
+### 3. Compile
+
 ```bash
 npx hardhat compile
 ```
-### Deploy to Fuji
 
-Example script snippet (in ```scripts/deploy.js```):
-```js
-const { ethers } = require("hardhat");
+### 4. Run the script
 
-async function main() {
-  const minterAddress = "0x27ca088aE7F52889f97323fd8234D9aD67a5697f";
-  const usdtqlAddress = "0x11Dc55cF35F472B363eEa3bdec5895c4edd270f1";
-  const qltokenAddress = "0xc2351Bf4f0e5e8Eccc02e88D63969ad08eaD1132";
+The script in [`script/deploy.js`](script/deploy.js) targets the Fuji network. By default it attaches to an already deployed `QLTTokenReceiver` instance and logs its address and configured QLToken address. To deploy a fresh instance instead, uncomment the `deploy(...)` line in the script (passing the Minter, USDTqL, and QLToken addresses to the constructor) and use that returned contract.
 
-  const QLTTokenReceiver = await ethers.getContractFactory("QLTTokenReceiver");
-  const qltReceiver = await QLTTokenReceiver.deploy(minterAddress, usdtqlAddress, qltokenAddress);
-
-  await qltReceiver.waitForDeployment();
-  console.log("QLTTokenReceiver deployed to:", await qltReceiver.getAddress());
-}
-
-main()
-  .then(() => process.exit(0))
-  .catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
+```bash
+npx hardhat run script/deploy.js --network fuji
 ```
 
-Run:
+After deployment, the converter is exercised by calling `convert()` on the deployed contract with exactly 10,000 wei of AVAX attached, from a wallet, a script, or any frontend using the contract ABI.
+
+> Note: this repository does not include a test suite. `npx hardhat test` will run with no tests until one is added.
+
+### Verifying on Snowtrace (optional)
+
+With `SNOWTRACE_API_KEY` set, the deployed contract can be verified by passing the three constructor arguments:
+
 ```bash
-npx hardhat run scripts/deploy.js --network fuji
-```
-
-Copy the deployed address from the log.
-
----
-
-## Converting to QLToken (Single Transaction)
-
-Once deployed, you can:
-
-- Call ```convert()``` from your wallet or using a script, sending exactly <b>10,000 wei</b> of AVAX:
-
-Or directly via a frontend/wallet (using the ABI).
-
----
-
-## Verification
-
-With Snowtrace (Fuji):
-
-Add ```SNOWTRACE_API_KEY``` to ```.env```, then you can use:
-```bash
-npx hardhat verify --network fuji <QLTTokenReceiver_address> \
+npx hardhat verify --network fuji <deployed_address> \
   0x27ca088aE7F52889f97323fd8234D9aD67a5697f \
   0x11Dc55cF35F472B363eEa3bdec5895c4edd270f1 \
   0xc2351Bf4f0e5e8Eccc02e88D63969ad08eaD1132
 ```
+
+## Environment variables
+
+Configuration is loaded from a `.env` file via `dotenv` and read in [`hardhat.config.js`](hardhat.config.js). The `.env` file is git-ignored and must never be committed.
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `PRIVATE_KEY` | Yes | Private key of the deploying/interacting account, used as the signer for the Fuji network. Fund it with Fuji testnet AVAX. |
+| `SNOWTRACE_API_KEY` | For verification | API key used by `hardhat-verify` to verify the contract source on Snowtrace. |
+
+The Fuji RPC endpoint (`https://api.avax-test.network/ext/bc/C/rpc`) is hardcoded in `hardhat.config.js` and does not require an environment variable.
+
+Example `.env`:
+
+```bash
+PRIVATE_KEY=your_private_key_here
+SNOWTRACE_API_KEY=your_snowtrace_api_key_here
+```
+
+## Author
+
+Krish Ojha
